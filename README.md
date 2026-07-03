@@ -151,3 +151,17 @@ Set up in `bootstrap/app.php`:
 
 - Middleware aliases: `tenant` (`InitializeTenancyFromUser`) and `abilities` (Sanctum's `CheckAbilities`, not registered by Sanctum itself in this version).
 - `withExceptions()` renders every exception on JSON requests as a plain `{"message": "..."}` with the correct status code — no `exception`/`file`/`line`/`trace` leaking into API responses regardless of `APP_DEBUG` (exceptions are still fully logged to `storage/logs/laravel.log` as usual). Note: Laravel's `Handler::render()` converts `ModelNotFoundException`/`AuthorizationException` into `HttpExceptionInterface` types (`NotFoundHttpException`/`AccessDeniedHttpException`) *before* custom `render()` callbacks run, so this matches on `ValidationException`/`AuthenticationException` directly (the two types Laravel doesn't pre-convert) and on `HttpExceptionInterface` + status code for everything else — matching on the original exception classes directly doesn't work for the converted ones.
+
+## AI assistance
+
+This project was built with Claude Code assisting throughout. A few concrete places it helped:
+
+- **Caught real issues, not just style nits** .
+
+- **Refresh token endpoint** — 
+
+- **Cache service + pagination** — `TaskService::list()`
+
+- **Debugging own mistakes out loud** 
+
+None of this replaces reviewing the code @Mohamed Khaled Elseadey
