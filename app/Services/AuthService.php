@@ -8,6 +8,7 @@ use App\Repositories\Contracts\UserRepositoryInterface;
 use App\Services\Contracts\UserNotifierInterface;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Validation\ValidationException;
+use Laravel\Sanctum\PersonalAccessToken;
 
 class AuthService
 {
@@ -52,6 +53,35 @@ class AuthService
     public function logout(User $user): void
     {
         $user->tokens()->delete();
+    }
+
+    public function refresh(string $plainTextToken): array
+    {
+        $refreshToken = PersonalAccessToken::findToken($plainTextToken);
+
+        if (! $refreshToken || ! $refreshToken->can('issue-access-token')) {
+            throw ValidationException::withMessages([
+                'refresh_token' => ['The refresh token is invalid.'],
+            ]);
+        }
+
+        if ($refreshToken->expires_at?->isPast()) {
+            throw ValidationException::withMessages([
+                'refresh_token' => ['The refresh token has expired.'],
+            ]);
+        }
+
+        $user = $refreshToken->tokenable;
+
+        $accessToken = $user->createToken(
+            'access_token',
+            ['access-api'],
+            now()->addMinutes(config('sanctum.expiration')),
+        );
+
+        return [
+            'access_token' => $accessToken->plainTextToken,
+        ];
     }
 
     private function issueTokens(User $user): array

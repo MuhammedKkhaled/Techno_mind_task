@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Requests\Auth\LoginRequest;
+use App\Http\Requests\Auth\RefreshTokenRequest;
 use App\Http\Requests\Auth\RegisterRequest;
 use App\Http\Resources\UserResource;
 use App\Services\AuthService;
@@ -34,6 +35,16 @@ class AuthController extends BaseApiController
         $this->authService->logout($request->user());
 
         return $this->successResponse('Logged out successfully.', []);
+    }
+
+    public function refresh(RefreshTokenRequest $request): JsonResponse
+    {
+        $result = $this->authService->refresh($request->validated()['refresh_token']);
+
+        return $this->successResponse('Token refreshed successfully.', [
+            'access_token' => $result['access_token'],
+            'token_type' => 'Bearer',
+        ]);
     }
 
     private function tokenData(array $result): array

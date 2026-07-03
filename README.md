@@ -2,15 +2,15 @@
 
 ## About
 
-Techno Mind backend API, built on Laravel 11. Currently implements token-based authentication (register / login / logout) via Sanctum, with background job processing through Horizon and self-generated OpenAPI docs through Scramble.
+Techno Mind backend API, built on Laravel 11. Multi-tenant (single-database), token-authenticated (Sanctum access + refresh tokens) API with a per-user task manager, background job processing through Horizon, and self-generated OpenAPI docs through Scramble.
 
 ## Stack
 
 - **PHP 8.2**, **Laravel ^11.31**
-- **laravel/sanctum** — API authentication (access + refresh tokens)
-- **laravel/horizon** + **predis/predis** — Redis queue dashboard/worker
+- **laravel/sanctum** — API authentication (access + refresh tokens, ability-scoped)
+- **stancl/tenancy** — single-database multi-tenancy (tenant-scoped via `tenant_id`/relationship, not separate databases)
+- **laravel/horizon** + **predis/predis** — Redis queue dashboard/worker, multiple named queues
 - **dedoc/scramble** — generates OpenAPI docs from routes/FormRequests automatically, no annotations needed
-- **stancl/tenancy** — installed for future multi-tenancy; not configured or wired up yet
 - **laravel/pint** — code style (PSR-12)
 
 ## Setup
@@ -42,22 +42,56 @@ Requests flow through a **Controller → Service → Repository** layering under
 routes/api.php
   → App\Http\Controllers\Api\*        thin controllers, extend BaseApiController
       → App\Http\Requests\*           FormRequests, all validation lives here
-      → App\Services\*                business logic (e.g. AuthService)
+      → App\Services\*                business logic (e.g. AuthService, TaskService)
           → App\Repositories\*        persistence, behind a Contracts\*Interface
       → App\Http\Resources\*          response shaping
 ```
 
 - `App\Http\Controllers\Api\BaseApiController` is the shared API base controller — gives every API controller `successResponse()` / `errorResponse()` helpers plus `fromResource()` for paginated resource output, so every endpoint returns a consistent JSON envelope.
-- Repositories are bound to their interfaces in `App\Providers\AppServiceProvider::register()` (e.g. `UserRepositoryInterface` → `UserRepository`), so services depend on the interface, not Eloquent directly.
-- Mail is sent through queued `Mailable`s (`implements ShouldQueue`) in `App\Mail`, dispatched from services — never sent synchronously from a controller.
+- `App\Http\Requests\BaseFormRequest` is the shared base for every FormRequest — overrides `failedValidation()` so all validation failures return a consistent `{"message": "..."}` 422, instead of Laravel's default `errors` bag shape.
+- Repositories and services that need swapping/mocking are bound to interfaces in `App\Providers\AppServiceProvider::register()` (`UserRepositoryInterface`, `TenantRepositoryInterface`, `TaskRepositoryInterface`, `UserNotifierInterface`), so callers depend on the interface, not the concrete class.
+- Mail is sent through queued `Mailable`s (`implements ShouldQueue`) in `App\Mail`, dispatched from services — never sent synchronously from a controller. Sending itself is isolated behind `UserNotifierInterface`/`UserNotifier`, so `AuthService` doesn't know about `Mail` or `Mailable` classes directly (keeps registration logic and notification delivery as separate concerns).
+
+### Multi-tenancy
+
+Single-database tenancy via `stancl/tenancy` — every `User` belongs to a `Tenant` (`tenant_id` column), and tenants share one database (no per-tenant DB/schema switching, no domain-based identification).
+
+- **Tenant identification**: not domain/subdomain based — the `tenant` middleware (`App\Http\Middleware\InitializeTenancyFromUser`) initializes tenancy from the authenticated Sanctum user (`tenancy()->initialize($user->tenant)`) after `auth:sanctum` runs. Every protected route uses `['auth:sanctum', 'abilities:access-api', 'tenant']`.
+- **`User`** is a "primary" tenant model — `use BelongsToTenant` adds a global query scope (`where tenant_id = current tenant`) and auto-fills `tenant_id` on create once tenancy is initialized.
+- **`Task`** is a "secondary" model — `use BelongsToPrimaryModel` + `getRelationshipToPrimaryModel(): 'user'` scopes it via `whereHas('user')`, inheriting `User`'s tenant scope transitively. No `tenant_id` column needed on `tasks`.
+- Registration (`AuthService::register()`) creates a brand-new `Tenant` ("`{name}`'s Organization") for every signup — there's no invite/join-existing-org flow.
+- `config/tenancy.php`: `bootstrappers => []` (no per-tenant cache/filesystem/queue switching — only DB-row scoping is needed here), `TenancyServiceProvider`'s `TenantCreated`/`TenantDeleted` listeners are empty (no per-tenant database to create/delete).
+- Full package reference: `.claude/Skills/stancl-tenancy/SKILL.md`.
 
 ### Auth
 
-`POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout` (auth:sanctum).
+`POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/refresh`, `POST /api/auth/logout` (`auth:sanctum` + `abilities:access-api` + `tenant`).
 
-- Register and login both log the user in immediately and return an `access_token` and a `refresh_token` (via `UserResource` + token payload), sourced from `config('sanctum.expiration')` / `config('sanctum.refresh_expiration')` (see `config/sanctum.php`).
+- Register and login both log the user in immediately and return an `access_token` and a `refresh_token` (via `UserResource` + token payload). Lifetimes come from `config('sanctum.expiration')` / `config('sanctum.refresh_expiration')` (`config/sanctum.php`), applied as each token's `expires_at`.
+- Tokens are ability-scoped: access tokens get `['access-api']`, refresh tokens get `['issue-access-token']`. Every data route requires the `abilities:access-api` middleware (`Laravel\Sanctum\Http\Middleware\CheckAbilities`, aliased in `bootstrap/app.php` — Sanctum doesn't register this alias itself), so a leaked refresh token **cannot** be used to call `/api/tasks` etc., only `/api/auth/refresh`.
+- `POST /api/auth/refresh` takes `{"refresh_token": "..."}` in the body (not a bearer header) and returns a new `access_token`. It deliberately does **not** go through the `auth:sanctum` guard: Sanctum's guard also enforces the global `config('sanctum.expiration')` against every token's `created_at`, which would silently cap the longer-lived refresh token at the access-token lifetime. Instead `AuthService::refresh()` resolves it manually via `PersonalAccessToken::findToken()` and checks only that token's own ability + `expires_at`. The refresh token itself is not rotated — the same one keeps working until it expires.
 - Logout revokes **all** of the user's tokens (`$user->tokens()->delete()`), not just the one used for the request.
-- Registration queues an onboarding email (`App\Mail\OnboardingMail`) — it won't send unless a queue worker (`queue:work` / `horizon`) is running against the `redis` connection.
+- Registration queues an onboarding email (`App\Mail\OnboardingMail`, dispatched via `UserNotifier`) on the `emails` queue — it won't send unless a queue worker is running against it (see Queues below).
+
+### Tasks
+
+`GET|POST /api/tasks`, `GET|PUT|PATCH|DELETE /api/tasks/{task}` (`auth:sanctum` + `abilities:access-api` + `tenant`).
+
+- A task belongs to exactly one user (`user_id`); `status` is a backed PHP enum (`App\TaskStatusEnum`: `todo` / `in_progress` / `done`) cast onto a plain `string` column.
+- `GET /api/tasks` supports `?status=`, `?search=` (title, case-insensitive substring), `?per_page=`, `?page=` — validated by `IndexTaskRequest`.
+- **Caching**: a user's full task list is cached under `tasks_user_{id}` via `App\Services\Cache\CacheService`. `Task`'s model `boot()` calls `CacheService::cacheTask($task)` (`rememberForever`, no expiry) on both the `saved` and `deleted` events, so the cache is rebuilt immediately after every write — it's not TTL-driven invalidation. `TaskService::list()` reads through `CacheService::remember()` with a 1-day TTL fallback (only relevant on a genuinely cold cache, e.g. right after a `cache:clear`), then applies status/search filtering and pagination **in memory** over that cached collection — filters and pagination are not separately cached per combination, only the full per-user list is.
+- All task queries are additionally scoped by `user_id` explicitly in `TaskRepository` (not just via the tenancy global scope) — ownership is enforced even if tenancy somehow isn't initialized.
+
+## Caching
+
+`App\Services\Cache\CacheService` is a thin static wrapper around the `Cache` facade: `get()`, `forget()`, `remember()`, `rememberForever()`, plus `CACHE_TTL` (1 day) as the default TTL for anything that wants one. Domain-specific cache builders (like `cacheTask()`) live alongside it in the same class, following a `cache*()` (force rebuild) vs. read-path (`remember`-wrapped) split.
+
+## Queues
+
+Multiple named Redis queues, defined in `App\QueueEnum` and consumed by Horizon's `supervisor-1` (`config/horizon.php`, `'queue' => QueueEnum::list()`, `emails` listed first for priority). Adding a new named queue: give the job/mailable `->onQueue('name')` (or set `App\QueueEnum` + reference `QueueEnum::list()`), and make sure the queue name is included in the Horizon supervisor's `queue` array — otherwise nothing will ever process it.
+
+- `emails` — `App\Mail\OnboardingMail` and other transactional mail
+- `default` — everything else
 
 ## API docs
 
@@ -89,4 +123,8 @@ Set up in `App\Providers\AppServiceProvider::boot()`:
 
 - Slow query logging — any query over 500ms is logged at `debug` level with SQL, bindings, and timing.
 - `api` rate limiter — 10 requests/minute, keyed by authenticated user ID (falls back to IP for guests).
-- Eloquent lazy loading is disallowed outside of production (`Model::preventLazyLoading`), so an N+1 access throws instead of silently querying.
+- Eloquent lazy loading is disallowed outside of production (`Model::preventLazyLoading`), so an N+1 access throws instead of silently querying. Resources that expose relations (e.g. `TaskResource`'s `user`) rely on repositories eager-loading them (`with('user')`) and use `whenLoaded()` defensively.
+
+Set up in `bootstrap/app.php`:
+
+- Middleware aliases: `tenant` (`InitializeTenancyFromUser`) and `abilities` (Sanctum's `CheckAbilities`, not registered by Sanctum itself in this version).
