@@ -3,6 +3,7 @@
 namespace App\Mail;
 
 use App\Models\User;
+use App\QueueEnum;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Mail\Mailable;
@@ -17,6 +18,7 @@ class OnboardingMail extends Mailable implements ShouldQueue
 
     public function __construct(public User $user)
     {
+        $this->onQueue(QueueEnum::EMAILS->getQueueName());
     }
 
     public function envelope(): Envelope

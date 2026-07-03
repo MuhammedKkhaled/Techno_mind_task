@@ -1,5 +1,6 @@
 <?php
 
+use App\QueueEnum;
 use Illuminate\Support\Str;
 
 return [
@@ -199,7 +200,7 @@ return [
     'defaults' => [
         'supervisor-1' => [
             'connection' => 'redis',
-            'queue' => ['default'],
+            'queue' => QueueEnum::list(),
             'balance' => 'auto',
             'autoScalingStrategy' => 'time',
             'maxProcesses' => 1,
