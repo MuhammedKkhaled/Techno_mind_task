@@ -18,7 +18,7 @@ class StoreTaskRequest extends BaseFormRequest
         return [
             'title' => ['required', 'string', 'max:255'],
             'description' => ['nullable', 'string' , 'max:1000'],
-            'status' => ['nullable', new Enum(TaskStatusEnum::class)],
+            'status' => ['required', new Enum(TaskStatusEnum::class)],
             'due_date' => ['nullable', 'date' , 'after_or_equal:today'],
         ];
     }
