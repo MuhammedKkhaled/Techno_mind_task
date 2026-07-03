@@ -27,6 +27,7 @@ class Task extends Model
         return [
             'status' => TaskStatusEnum::class,
             'due_date' => 'date',
+            'due_date_notified_at' => 'datetime',
         ];
     }
 
