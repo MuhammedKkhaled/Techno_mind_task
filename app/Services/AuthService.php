@@ -2,12 +2,11 @@
 
 namespace App\Services;
 
-use App\Mail\OnboardingMail;
 use App\Models\User;
 use App\Repositories\Contracts\TenantRepositoryInterface;
 use App\Repositories\Contracts\UserRepositoryInterface;
+use App\Services\Contracts\UserNotifierInterface;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\Mail;
 use Illuminate\Validation\ValidationException;
 
 class AuthService
@@ -15,6 +14,7 @@ class AuthService
     public function __construct(
         private readonly UserRepositoryInterface $users,
         private readonly TenantRepositoryInterface $tenants,
+        private readonly UserNotifierInterface $notifier,
     ) {
     }
 
@@ -31,7 +31,7 @@ class AuthService
             'password' => Hash::make($data['password']),
         ]);
 
-        Mail::to($user)->queue(new OnboardingMail($user));
+        $this->notifier->sendOnboardingEmail($user);
 
         return $this->issueTokens($user);
     }

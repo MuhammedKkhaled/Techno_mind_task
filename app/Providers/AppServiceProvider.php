@@ -6,6 +6,8 @@ use App\Repositories\Contracts\TenantRepositoryInterface;
 use App\Repositories\Contracts\UserRepositoryInterface;
 use App\Repositories\TenantRepository;
 use App\Repositories\UserRepository;
+use App\Services\Contracts\UserNotifierInterface;
+use App\Services\UserNotifier;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\ServiceProvider;
 use Illuminate\Database\Events\QueryExecuted;
@@ -22,6 +24,7 @@ class AppServiceProvider extends ServiceProvider
     {
         $this->app->bind(UserRepositoryInterface::class, UserRepository::class);
         $this->app->bind(TenantRepositoryInterface::class, TenantRepository::class);
+        $this->app->bind(UserNotifierInterface::class, UserNotifier::class);
     }
 
     /**
