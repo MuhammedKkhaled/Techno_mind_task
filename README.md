@@ -34,6 +34,13 @@ php artisan horizon   # dashboard at /horizon, or:
 php artisan queue:work
 ```
 
+To run scheduled tasks (the overdue-task notification cron, see below), either run the scheduler loop locally or install a single cron entry that ticks it every minute:
+
+```bash
+php artisan schedule:work                       # foreground loop, useful for local dev
+* * * * * php artisan schedule:run >> /dev/null  # crontab entry for real deployments
+```
+
 ## Architecture
 
 Requests flow through a **Controller → Service → Repository** layering under a versionless API namespace:
@@ -82,6 +89,21 @@ Single-database tenancy via `stancl/tenancy` — every `User` belongs to a `Tena
 - **Caching**: a user's full task list is cached under `tasks_user_{id}` via `App\Services\Cache\CacheService`. `Task`'s model `boot()` calls `CacheService::cacheTask($task)` (`rememberForever`, no expiry) on both the `saved` and `deleted` events, so the cache is rebuilt immediately after every write — it's not TTL-driven invalidation. `TaskService::list()` reads through `CacheService::remember()` with a 1-day TTL fallback (only relevant on a genuinely cold cache, e.g. right after a `cache:clear`), then applies status/search filtering and pagination **in memory** over that cached collection — filters and pagination are not separately cached per combination, only the full per-user list is.
 - All task queries are additionally scoped by `user_id` explicitly in `TaskRepository` (not just via the tenancy global scope) — ownership is enforced even if tenancy somehow isn't initialized.
 
+### Overdue task notifications (cron)
+
+`App\Console\Commands\NotifyOverdueTasks` (`php artisan tasks:notify-overdue`), scheduled daily in `routes/console.php`:
+
+```php
+Schedule::command(NotifyOverdueTasks::class)->daily()->withoutOverlapping()->onOneServer();
+```
+
+- Finds tasks where `due_date` is in the past, `status != done`, and `due_date_notified_at IS NULL` — the query walks the whole `tasks` table (spans every tenant; `Task::withoutParentModel()` bypasses the tenancy scope since a console command has no authenticated user to derive a tenant from) via `chunkById(200, ...)` to keep memory flat regardless of table size.
+- **Speed**: the command only *enqueues* `App\Mail\TaskOverdueMail` (`ShouldQueue`, `emails` queue) per task — it never sends mail synchronously in the loop — so the command itself finishes fast no matter the volume; actual delivery happens on the queue worker.
+- **Idempotency**: after a chunk is queued, those task IDs get `due_date_notified_at` set in one bulk `UPDATE` — a composite index on (`due_date`, `status`, `due_date_notified_at`) backs the lookup query. Re-running the command is a no-op for tasks already notified; it will never spam the same overdue task on every daily run.
+- **Fault tolerance**: each task is dispatched inside a try/catch — one bad row logs via `Log::error()` and the loop continues rather than aborting the whole run. `TaskOverdueMail` sets `$tries = 3` / `$backoff = [10, 30, 60]`, so transient SMTP failures (seen in practice against Mailtrap under burst load) retry automatically through Laravel's queue system instead of custom retry code; a job that exhausts retries lands in `failed_jobs` rather than being silently dropped. `withoutOverlapping()` + `onOneServer()` on the schedule prevent duplicate/concurrent runs.
+- `TaskOverdueMail`'s `Task` is eager-loaded with `user` before being handed to the mailable — required both to avoid `LazyLoadingViolationException` (see `preventLazyLoading` below) and because Laravel re-serializes any *loaded* relations across the queue boundary, so the worker doesn't need a fresh lazy fetch.
+- Email-only for now (reuses the existing Mail/queue setup) — there's no `notifications` table/database channel in this app yet.
+
 ## Caching
 
 `App\Services\Cache\CacheService` is a thin static wrapper around the `Cache` facade: `get()`, `forget()`, `remember()`, `rememberForever()`, plus `CACHE_TTL` (1 day) as the default TTL for anything that wants one. Domain-specific cache builders (like `cacheTask()`) live alongside it in the same class, following a `cache*()` (force rebuild) vs. read-path (`remember`-wrapped) split.
@@ -90,7 +112,7 @@ Single-database tenancy via `stancl/tenancy` — every `User` belongs to a `Tena
 
 Multiple named Redis queues, defined in `App\QueueEnum` and consumed by Horizon's `supervisor-1` (`config/horizon.php`, `'queue' => QueueEnum::list()`, `emails` listed first for priority). Adding a new named queue: give the job/mailable `->onQueue('name')` (or set `App\QueueEnum` + reference `QueueEnum::list()`), and make sure the queue name is included in the Horizon supervisor's `queue` array — otherwise nothing will ever process it.
 
-- `emails` — `App\Mail\OnboardingMail` and other transactional mail
+- `emails` — `App\Mail\OnboardingMail`, `App\Mail\TaskOverdueMail`
 - `default` — everything else
 
 ## API docs
@@ -128,3 +150,4 @@ Set up in `App\Providers\AppServiceProvider::boot()`:
 Set up in `bootstrap/app.php`:
 
 - Middleware aliases: `tenant` (`InitializeTenancyFromUser`) and `abilities` (Sanctum's `CheckAbilities`, not registered by Sanctum itself in this version).
+- `withExceptions()` renders every exception on JSON requests as a plain `{"message": "..."}` with the correct status code — no `exception`/`file`/`line`/`trace` leaking into API responses regardless of `APP_DEBUG` (exceptions are still fully logged to `storage/logs/laravel.log` as usual). Note: Laravel's `Handler::render()` converts `ModelNotFoundException`/`AuthorizationException` into `HttpExceptionInterface` types (`NotFoundHttpException`/`AccessDeniedHttpException`) *before* custom `render()` callbacks run, so this matches on `ValidationException`/`AuthenticationException` directly (the two types Laravel doesn't pre-convert) and on `HttpExceptionInterface` + status code for everything else — matching on the original exception classes directly doesn't work for the converted ones.
